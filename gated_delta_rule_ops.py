@@ -13,14 +13,17 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
     def forward(ctx, q, k, v, beta, g, BT, initial_state, output_final_state):
         g = g.float()
         #currently we force the length to be multiple of BT
+        # print('ChunkGatedDeltaRuleFunction forward')
+        # print('g', g.shape)
+        # g = F.pad(g, (0, 3))
 
-        g = F.pad(g, (0, 3))
-        print('g.shape[-1]', g.shape[-1], g.shape)
         assert g.shape[-1] % BT == 0
         g = rearrange(g, 'b h (n c) -> b h n c', c=BT)
         # change the base of log from e to 2, i.e., ln->log2. To use tl.math.exp2 inside the kernel.
         g = g.cumsum(-1) * 1.44269504
         g = rearrange(g, 'b h n c -> b h (n c)')
+        # g = g[:, :, :-3]
+        # print('g.shape', g.shape)
 
         ### obtain WY representation. u is actually the new v.
         w, u, A_w, A_u, A_w_original, A_u_original = fwd_prepare_wy_repr(k, v, beta, g, BT)
@@ -48,16 +51,23 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         w, u = fwd_recompute_w_u(k, v, beta, A_w, A_u, BT)
         # checkpont_level=1, recomputation.
         # we need fp32 state to compute gradient.
+        # print(q.shape, k.shape)
         if h is None:
             h, v_new = chunk_fwd_h_fn(k, w, u, g, BT, initial_state, None, state_in_fp32=True)
         du = fwd_prepare_du(q, k, g, do, BT)
         dh, du = chunk_bwd_dhu_fn(q, k, w, g, do, du, BT)
         dq, dk, dw, dg = chunk_bwd_dqkw_fn(q, k, v_new, w, g, h, du, do, dh, BT)
         dk2, dv, dbeta, dg2 = bwd_prepare_wy_repr(k, v, beta, g, A_w, A_u, A_w_original, A_u_original, dw, du, BT)
+        # dg = dg[:, :, :-3]
+        #print('dg.shape:', dg.shape)
+        #print('dg2.shape:', dg2.shape)
+
         dk.add_(dk2)
         dg.add_(dg2)
 
+        # dg = F.pad(dg, (0, 3))
         dg = rearrange(dg, 'b h (n c) -> b h n c', c=BT)
+        # dg = dg[:, :, :-3]
         # mask = (torch.arange(0, BT)[:, None] >= torch.arange(0, BT)[None, :]).to(dg)
         assert dg.dtype == torch.float32, "dg should be fp32"
         # print(dg.abs().max())
@@ -86,11 +96,14 @@ def chunk_gated_delta_rule(
     initial_state: torch.Tensor = None,
     output_final_state: bool = False):
     assert q.dtype == k.dtype == v.dtype
+    #print(' !!! chunk_gated_delta_rule !!!')
+    #print(f'1. q {q.shape}, k {k.shape}, v {v.shape}, g {g.shape}')
     L = q.shape[-2]
     if L % BT != 0:
         q, k, v, beta, g = map(lambda x: F.pad(x, (0, 0, 0, BT - L % BT)), [q, k, v, beta.unsqueeze(-1), g.unsqueeze(-1)])
     g = g.squeeze(-1)
     beta = beta.squeeze(-1)
+    #print(f'2. q {q.shape}, k {k.shape}, v {v.shape}, g {g.shape}')
 
     if initial_state is not None:
         initial_state = initial_state.detach()

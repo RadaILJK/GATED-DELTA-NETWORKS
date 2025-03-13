@@ -13,9 +13,15 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 import math
 
+try:
+    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+except ImportError:
+    causal_conv1d_fn = None
+    causal_conv1d_update = None
+
 if TYPE_CHECKING:
     from torch import Tensor
-
+'''
 class RMSNorm(torch.nn.Module):
     """Root Mean Square Layer Normalization.
 
@@ -38,7 +44,7 @@ class RMSNorm(torch.nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-'''
+
 class FusedRMSNorm(torch.nn.Module):
     def __init__(self, size: int, dim: int = -1, eps: float = 1e-5):
         super().__init__()
@@ -54,19 +60,125 @@ class FusedRMSNorm(torch.nn.Module):
         return rms_norm(x, self.weight, self.eps)
 '''
 
-class ShortConvolution(nn.Module):
-    """Реализация короткой свёртки на PyTorch."""
-    def __init__(self, dim: int, kernel_size: int, activation: Optional[str] = None):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.conv = nn.Conv1d(dim, dim, kernel_size, padding=kernel_size // 2, bias=False)
-        self.activation = activation
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, state: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        if self.activation == 'silu':
-            x = F.silu(x)
-        return x
+class ShortConvolution(nn.Conv1d):
+    """
+    Simple wrapper around `nn.Conv1d` that accepts dimension last.
+    This implementation is designed to work exclusively on CPU without CUDA dependencies.
+    """
+
+    def __init__(
+            self,
+            hidden_size: int,
+            kernel_size: int,
+            bias: bool = False,
+            activation: Optional[str] = 'silu',
+            device: Optional[torch.device] = None,
+            dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=kernel_size,
+            groups=hidden_size,
+            bias=bias,
+            padding=kernel_size - 1,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.hidden_size = hidden_size
+        self.activation = None
+        if activation is not None:
+            assert activation in ['silu', 'swish'], f"Activation `{activation}` not supported yet."
+            self.activation = activation
+
+    def extra_repr(self):
+        s = ('{in_channels}, {out_channels}, kernel_size={kernel_size}'
+             ', stride={stride}')
+        if self.padding != (0,) * len(self.padding):
+            s += ', padding={padding}'
+        if self.dilation != (1,) * len(self.dilation):
+            s += ', dilation={dilation}'
+        if self.output_padding != (0,) * len(self.output_padding):
+            s += ', output_padding={output_padding}'
+        if self.groups != 1:
+            s += ', groups={groups}'
+        if self.bias is None:
+            s += ', bias=False'
+        if self.padding_mode != 'zeros':
+            s += ', padding_mode={padding_mode}'
+        if self.activation is not None:
+            s += ', activation={activation}'
+        return s.format(**self.__dict__)
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+            cache: Optional[torch.Tensor] = None,
+            output_final_state: bool = False,
+            seq_idx: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x (`torch.Tensor`):
+                Tensor of shape `[batch_size, seq_len, hidden_size]`
+            mask (`Optional[torch.Tensor]`):
+                Attention mask dealing with padded positions.
+            cache (`Optional[torch.Tensor]`):
+                Previous cache tensor of shape `[batch_size, hidden_size, kernel_size]`.
+                If provided, the cache is updated **inplace**.
+            output_final_state (Optional[bool]):
+                Whether to output the final state of shape `[batch_size, hidden_size, kernel_size]`. Default: `False`.
+            seq_idx (Optional[torch.Tensor]):
+                Sequence index for each token. Used for varlen. Default: `None`.
+                Shape: [batch_size, seq_len]
+        Returns:
+            Tensor of shape `[batch_size, seq_len, hidden_size]`.
+        """
+        # print('x.shape in ShortConvolution forward', x.shape)
+        batch_size, _, hidden_size = x.shape
+        if mask is not None:
+            x = x.mul_(mask.unsqueeze(-1))
+        if output_final_state and cache is None:
+            cache = x.new_zeros(batch_size, hidden_size, self.kernel_size[0])
+        if cache is not None and x.shape[1] == 1:
+            return self.step(x, cache)
+
+        x = rearrange(x, "b t d -> b d t")
+        # Update state (B D W)
+        if cache is not None:
+            cache.copy_(F.pad(x, (self.kernel_size[0] - x.shape[-1], 0)))
+
+        # Perform convolution using PyTorch's native implementation
+        x = self._conv_forward(x, self.weight, self.bias)[..., :x.shape[-1]]
+        if self.activation is not None:
+            x = ACT2FN[self.activation](x)
+
+        return rearrange(x, "b d t -> b t d"), cache
+
+    def step(
+            self,
+            x: torch.Tensor,
+            cache: torch.Tensor
+    ):
+        assert x.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+
+        x = x.squeeze(1)
+        dtype = x.dtype
+        cache.copy_(torch.roll(cache, shifts=-1, dims=-1))
+        cache[:, :, -1] = x
+        x = torch.sum(cache * rearrange(self.weight, "d 1 w -> d w"), dim=-1)
+        if self.bias is not None:
+            x = x + self.bias
+        if self.activation is not None:
+            x = ACT2FN[self.activation](x).to(dtype=dtype)
+        return x.unsqueeze(1), cache
+
+    @property
+    def state_size(self) -> int:
+        return self.hidden_size * self.kernel_size[0]
 
 class CustomGate(nn.Module):
     def __init__(self, head_v_dim, norm_eps=1e-5, elementwise_affine=True):
@@ -81,6 +193,7 @@ class CustomGate(nn.Module):
         if g.shape != o.shape:
             g = F.pad(g, (0, 0, 0, 0, 0, 3))
         o = o * g  # Комбинируем o и g
+
         return o
 
 
@@ -119,6 +232,7 @@ class GatedDeltaNet(nn.Module):
         use_mva: bool = False,
         use_residual: bool = False,
         use_input_gate: bool = False,
+        vocab_size: int = 50257,
     ) -> GatedDeltaNet:
         super().__init__()
         self.qk_norm = qk_norm
@@ -153,9 +267,19 @@ class GatedDeltaNet(nn.Module):
         self.v_proj = nn.Linear(hidden_size, self.value_dim_per_group, bias=False)
         self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
 
+        # Эмбеддинг-слой
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.lm_head = nn.Linear(hidden_size, vocab_size)
+
+        '''
         self.q_conv1d = nn.Conv1d(self.key_dim, self.key_dim, conv_size, padding=conv_size-1, bias=conv_bias)
         self.k_conv1d = nn.Conv1d(self.key_dim_per_group, self.key_dim_per_group, conv_size, padding=conv_size-1, bias=conv_bias)
         self.v_conv1d = nn.Conv1d(self.value_dim_per_group, self.value_dim_per_group, conv_size, padding=conv_size-1, bias=conv_bias)
+        '''
+        self.q_conv1d = ShortConvolution(self.key_dim, conv_size, activation='silu' if self.qk_norm != 'softmax' else None)
+        self.k_conv1d = ShortConvolution(self.key_dim_per_group, conv_size, activation='silu' if self.qk_norm != 'softmax' else None)
+        self.v_conv1d = ShortConvolution(self.value_dim_per_group, conv_size, activation='silu')
+
         self.gk_proj = nn.Linear(hidden_size, self.num_heads, bias=not use_mamba_gate)
         self.b_proj = nn.Linear(hidden_size, self.num_heads, bias=True)
 
@@ -218,23 +342,37 @@ class GatedDeltaNet(nn.Module):
         conv_state_k = last_state[1] if use_cache else None
         conv_state_v = last_state[2] if use_cache else None
 
+        # print(hidden_states.shape)
+
+        hidden_states = self.embedding(hidden_states)  # (batch_size, sequence_length, hidden_size)
+
+        # print(hidden_states.shape)
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
+        # print(f'1. q {q.shape}, k {k.shape}, v {v.shape}')
+        '''
         q = self.q_conv1d(q.transpose(1, 2)).transpose(1, 2)
         k = self.k_conv1d(k.transpose(1, 2)).transpose(1, 2)
         v = self.v_conv1d(v.transpose(1, 2)).transpose(1, 2)
+        '''
+        q = self.q_conv1d(q, attention_mask, conv_state_q)[0]
+        k = self.k_conv1d(k, attention_mask, conv_state_k)[0]
+        v = self.v_conv1d(v, attention_mask, conv_state_v)[0]
 
         if attention_mask is not None:
             v = v.mul_(attention_mask.unsqueeze(-1))
 
         gk = self.gk_proj(hidden_states).float()
+
         if self.use_mamba_gate:
             gk = -self.A_log.float().exp() * F.softplus(gk + self.dt_bias)
         else:
             gk = F.logsigmoid(gk) / self.gate_logit_normalizer
+
         gk = gk.transpose(1, 2)
+
 
         beta = self.b_proj(hidden_states).float().sigmoid()
         beta = beta.transpose(1, 2)
@@ -288,6 +426,7 @@ class GatedDeltaNet(nn.Module):
             o = rearrange(self.g_norm(o), 'b l h d -> b l (h d)')
             o = o * self.gate_fn(g)
         o = self.o_proj(o)
+        o = self.lm_head(o)
         return o, None, past_key_values
 
     def init_state(self, batch_size: int) -> Tuple[torch.Tensor]:

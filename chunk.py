@@ -148,6 +148,9 @@ def fwd_prepare_wy_repr_kernel_u(k, v, beta, g, u, A, A_original, T, K, V, BT, B
                 b_A += torch.matmul(b_kb, b_k.transpose(-1, -2))  # (BT, BT)
 
             # Применение экспоненты и маски к b_A
+            # print(b_g[:, None].shape, b_g[None, :].shape, b_A.shape, BT)
+            if b_g.shape != BT:
+                continue
             b_A = b_A * torch.exp2(b_g[:, None] - b_g[None, :])  # (BT, BT)
             mask = torch.tril(torch.ones((BT, BT), device=k.device), diagonal=-1)
             b_A = -b_A * mask
@@ -233,6 +236,8 @@ def fwd_recompute_w_u(k, v, beta, A_w, A_u, BT):
 
                 # Загрузка блока v
                 b_v = v[i_bh // H, i_bh % H, start_t:end_t, start_v:end_v]  # (BT, BV)
+                if b_beta[:, None].shape[0] != b_v.shape[0]:
+                    continue
                 b_vb = b_v * b_beta[:, None]  # (BT, BV)
 
                 # Вычисление b_u
@@ -255,6 +260,8 @@ def fwd_recompute_w_u(k, v, beta, A_w, A_u, BT):
 
                 # Загрузка блока k
                 b_k = k[i_bh // H, i_bh % H, start_t:end_t, start_k:end_k]  # (BT, BK)
+                if b_beta[:, None].shape[0] != b_k.shape[0]:
+                    continue
                 b_kb = b_k * b_beta[:, None]  # (BT, BK)
 
                 # Вычисление b_w
@@ -317,6 +324,8 @@ def chunk_fwd_h_fn(k, w, u, g, BT, initial_state=None, final_state=None, state_i
 
             # b_h_cumsum = torch.zeros((BK, BV), dtype=torch.float32, device=k.device)
             b_h_cumsum = torch.zeros((K, V), dtype=torch.float32, device=k.device)
+            if end_t - 1 >= g.shape[2]:
+                continue
             b_g_last = g[i_bh // H, i_bh % H, end_t - 1]
 
             # Обработка подблоков
@@ -415,6 +424,9 @@ def chunk_fwd_o_fn(q, k, v_new, g, h, BT): # Вопросики к 0 :)
 
             # Загрузка блока g
             b_g = g[i_bh // H, i_bh % H, start_t:end_t]  # (BT,)
+            # print(b_o.shape, b_g.shape)
+            if b_g.shape != BT:
+                continue
             b_o = b_o * torch.exp2(b_g[:, None])  # (BT, BV) * (BT, 1) -> (BT, BV)
             b_s = b_s * torch.exp2(b_g[:, None] - b_g[None, :])  # (BT, BT) * (BT, BT) -> (BT, BT)
 
@@ -484,11 +496,14 @@ def fwd_prepare_du(q, k, g, do, BT):
                 b_q = b_q * scale
 
                 # Вычисление b_A
-                if b_k.shape[1] == b_q.shape[1]:
+                # print(b_k.shape, b_q.shape)
+                if b_k.shape[1] == b_q.shape[0] and b_k.shape[0] == b_q.shape[1] :
                     b_A += torch.matmul(b_k, b_q)  # (BT, BK) @ (BK, BT) -> (BT, BT)
 
             # Загрузка блока g
             b_g = g[i_bh // H, i_bh % H, start_t:end_t]  # (BT,)
+            if b_g.shape != BT:
+                continue
             b_A = b_A * torch.exp2(b_g[None, :] - b_g[:, None])  # (BT, BT)
 
             # Применение маски к b_A
@@ -565,6 +580,8 @@ def chunk_bwd_dhu_fn(q, k, w, g, do, dv, BT):
                     dh[i_bh // H, i_bh % H, i_t * K + start_k:i_t * K + end_k, start_v:end_v] = b_dh[:end_k - start_k]
 
                     b_dh_tmp = torch.zeros((BK, BV), dtype=torch.float32)  # [BK, BV]
+                    if end_t - 1 >= g.shape[2]:
+                        continue
                     bg_last = g[i_bh // H, i_bh % H, end_t - 1]  # Последнее значение g в блоке
 
                     # Обратный проход по подблокам
@@ -587,14 +604,16 @@ def chunk_bwd_dhu_fn(q, k, w, g, do, dv, BT):
                         b_g = g[i_bh // H, i_bh % H, start_t + start_c:start_t + end_c]  # (BC,)
 
                         # Вычисление b_q и b_w
-                        if b_q.shape[1] == 0:
+                        # print(b_q.shape, b_w.shape, torch.exp2(b_g)[None, :].shape)
+                        if b_q.shape != b_k.shape:
                             continue
 
-                        b_q = b_q * scale * torch.exp2(b_g)[None, :]  # (BK, BC)
+                        b_q = b_q * scale * torch.exp2(b_g)[None, :].t()  # (BK, BC)
                         if b_w.shape[1] != 0:
-                            b_w = b_w * torch.exp2(b_g)[None, :]  # (BK, BC)
+                            b_w = b_w * torch.exp2(b_g)[None, :].t()  # (BK, BC)
 
                         # Вычисление b_dh_tmp
+                        # print(b_dh_tmp.shape, b_k.shape)
                         b_dh_tmp += torch.matmul(b_q, b_do.to(b_q.dtype))  # (BK, BC) @ (BC, BV) -> (BK, BV)
 
                         # Вычисление b_k
@@ -639,6 +658,7 @@ def chunk_bwd_dqkw_fn(q, k, v_new, w, g, h, du, do, dh, BT):
         dg: Градиент временных масштабов, форма (B, H, T).
     """
     B, H, T, K = q.shape
+    # print(T)
     V = v_new.shape[-1]
 
     # Определение размеров блоков
@@ -672,6 +692,8 @@ def chunk_bwd_dqkw_fn(q, k, v_new, w, g, h, du, do, dh, BT):
                 b_dg_last = torch.zeros(BK, dtype=torch.float32)  # Исправлено: форма (BK,)
                 b_dg = torch.zeros(BT, dtype=torch.float32)
 
+                if end_t - 1 >= g.shape[2]:
+                    continue
                 bg_last = g[i_bh // H, i_bh % H, end_t - 1]
 
                 for i_v in range(cdiv(V, BV)):
@@ -690,12 +712,14 @@ def chunk_bwd_dqkw_fn(q, k, v_new, w, g, h, du, do, dh, BT):
                     # print(b_dg_last.shape, b_h.shape, b_dh.shape, torch.sum(b_h * b_dh, dim=1).shape)
                     if b_h.shape[0] == 0:
                         continue
-                    b_dg_last += torch.sum(b_h * b_dh, dim=1)  # (BV, BK) -> (BK,)
+                    b_dg_last += torch.sum(b_h * b_dh, dim=0)  # (BV, BK) -> (BK,)
 
                     # Вычисление b_ds
                     b_ds += torch.matmul(b_do, b_v.transpose(0, 1))  # (BT, BV) @ (BV, BT) -> (BT, BT)
 
                     # Вычисление b_dq, b_dk, b_dw
+                    if b_h.t().shape[1] != BK:
+                        continue
                     b_dq += torch.matmul(b_do, b_h.t())  # (BT, BV) @ (BV, BK) -> (BT, BK)
                     # print(b_v.shape, b_v.t().shape, b_dh.shape)
                     b_dk += torch.matmul(b_v, b_dh.t())  # (BV, BT) @ (BV, BK) -> (BT, BK)
@@ -710,6 +734,9 @@ def chunk_bwd_dqkw_fn(q, k, v_new, w, g, h, du, do, dh, BT):
                 # Вычисление b_dq, b_dk, b_dw
                 b_g_exp_qw = torch.exp2(b_g)[:, None]
                 b_dq *= b_g_exp_qw * scale
+                if b_q.shape[1] != BK:
+                    continue
+                # print(b_dq.shape, b_q.shape)
                 b_dg += torch.sum(b_dq * b_q, dim=1)
                 b_dw *= b_g_exp_qw
                 b_dg -= torch.sum(b_dw * b_w, dim=1)
@@ -799,6 +826,8 @@ def bwd_prepare_wy_repr_kernel_dA(k, v, beta, dw, du, A_w, A_u, dA_w, dA_u, dk, 
                 # b_beta_v = b_beta.unsqueeze(1).expand(-1, BV, -1)  # (BT, BV, K)
                 # b_beta_v = b_beta_v.mean(dim=-1)  # (BT, BV)
                 # b_v_beta = b_v * b_beta_v  # (BT, BV)
+                if b_beta[:, None].shape[0] != b_v.shape[0]:
+                    continue
                 b_v_beta = b_v * b_beta[:, None]
 
                 b_dA_u += torch.matmul(b_du, b_v_beta.transpose(-1, -2))  # (BT, BT)
@@ -818,6 +847,8 @@ def bwd_prepare_wy_repr_kernel_dA(k, v, beta, dw, du, A_w, A_u, dA_w, dA_u, dk, 
                 b_k = k[i_bh // H, i_bh % H, start_t:end_t, start_k:end_k]  # (BT, BK)
                 b_dw = dw[i_bh // H, i_bh % H, start_t:end_t, start_k:end_k]  # (BT, BK)
 
+                if b_beta[:, None].shape[0] != b_k.shape[0]:
+                    continue
                 b_k_beta = b_k * b_beta[:, None]  # (BT, BK)
 
                 b_dA_w += torch.matmul(b_dw, b_k_beta.transpose(-1, -2))  # (BT, BT)
@@ -881,6 +912,8 @@ def bwd_prepare_wy_repr_dk_dbeta_dg(k, beta, g, dA_w, dA_u, A_w, dk, dbeta, dg, 
             b_A_w = A_w[i_bh // H, i_bh % H, start_t:end_t, :BT]  # (BT, BT)
 
             # Вычисление dg
+            if b_g.shape != BT:
+                continue
             b_dA = (b_dA_w + b_dA_u * torch.exp2(b_g[:, None] - b_g[None, :]))  # (BT, BT)
             mask = torch.tril(torch.ones((BT, BT), device=k.device), diagonal=-1)
             b_dA = -b_dA * mask
@@ -899,12 +932,16 @@ def bwd_prepare_wy_repr_dk_dbeta_dg(k, beta, g, dA_w, dA_u, A_w, dk, dbeta, dg, 
                 b_k = k[i_bh // H, i_bh % H, start_t:end_t, start_k:end_k]  # (BT, BK)
                 b_dk_beta = torch.matmul(b_dA, b_k)  # (BT, BK)
                 b_dbeta += torch.sum(b_dk_beta * b_k, dim=1)  # (BT,)
+                if b_beta[:, None].shape[0] != b_k.shape[0]:
+                    continue
                 b_dk = torch.matmul(b_dA.transpose(-1, -2), b_k * b_beta[:, None])  # (BT, BK)
                 dk[i_bh // H, i_bh % H, start_t:end_t, start_k:end_k] = b_dk
 
             # Обновление dbeta
             # b_dbeta = b_dbeta.unsqueeze(1).expand(-1, K)  # (BT, K)
             # print(dbeta[i_bh // H, i_bh % H, start_t:end_t].shape, b_dbeta.shape)
+            if dbeta[i_bh // H, i_bh % H, start_t:end_t].shape[0] != b_dbeta.shape[0]:
+                continue
             dbeta[i_bh // H, i_bh % H, start_t:end_t] += b_dbeta
 
 
