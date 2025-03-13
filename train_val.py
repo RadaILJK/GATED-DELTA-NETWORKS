@@ -121,3 +121,5 @@ for epoch in range(num_epochs):
     print(f"Epoch [{epoch+1}/{num_epochs}] completed.")
     print(f"  Train Loss: {train_epoch_loss:.4f}, Perplexity: {math.exp(train_epoch_loss):.4f}")
     print(f"  Val Loss: {val_epoch_loss:.4f}, Perplexity: {math.exp(val_epoch_loss):.4f}")
+
+torch.save(model.state_dict(), "gated_delta_net_2.pth")
