@@ -7,10 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from gated_delta_rule_ops import chunk_gated_delta_rule
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from datasets import load_dataset
-from transformers import AutoTokenizer
+from rmsnorms import RMSNorm, FusedRMSNormSwishGate
 import math
 
 try:
@@ -21,44 +18,6 @@ except ImportError:
 
 if TYPE_CHECKING:
     from torch import Tensor
-'''
-class RMSNorm(torch.nn.Module):
-    """Root Mean Square Layer Normalization.
-
-    Derived from https://github.com/bzhangGo/rmsnorm/blob/master/rmsnorm_torch.py. BSD 3-Clause License:
-    https://github.com/bzhangGo/rmsnorm/blob/master/LICENSE.
-    """
-
-    def __init__(self, size: int, dim: int = -1, eps: float = 1e-5) -> None:
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(size))
-        self.eps = eps
-        self.dim = dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # NOTE: the original RMSNorm paper implementation is not equivalent
-        norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
-        x_normed = x * torch.rsqrt(norm_x + self.eps)
-        return self.weight * x_normed
-
-    def reset_parameters(self):
-        torch.nn.init.ones_(self.weight)
-
-
-class FusedRMSNorm(torch.nn.Module):
-    def __init__(self, size: int, dim: int = -1, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(size))
-        self.dim = dim
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        init.ones_(self.weight)
-
-    def forward(self, x):
-        return rms_norm(x, self.weight, self.eps)
-'''
 
 
 class ShortConvolution(nn.Conv1d):
@@ -180,22 +139,6 @@ class ShortConvolution(nn.Conv1d):
     def state_size(self) -> int:
         return self.hidden_size * self.kernel_size[0]
 
-class CustomGate(nn.Module):
-    def __init__(self, head_v_dim, norm_eps=1e-5, elementwise_affine=True):
-        super().__init__()
-        self.norm = nn.LayerNorm(head_v_dim, eps=norm_eps, elementwise_affine=elementwise_affine)
-        self.activation = nn.SiLU()
-
-    def forward(self, o, g):
-        o = self.norm(o)
-        o = self.activation(o)
-        # print(g.shape, o.shape)
-        if g.shape != o.shape:
-            g = F.pad(g, (0, 0, 0, 0, 0, 3))
-        o = o * g  # Комбинируем o и g
-
-        return o
-
 
 ACT2FN = {
     "swish": nn.SiLU(),
@@ -210,21 +153,22 @@ ACT2FN = {
     # Добавьте другие функции активации по необходимости
 }
 
+
 class GatedDeltaNet(nn.Module):
     def __init__(
         self,
-        mode: str = 'chunk',
+        mode: str = 'chunk',    # Режим работы модели
         hidden_size: int = 1024,
-        expand_k: float = 0.75,
-        expand_v: float = 1.5,
-        num_heads: int = 9,
+        expand_k: float = 0.75,  # Коэффициент расширения для ключей
+        expand_v: float = 1.5,   # Коэффициент расширения для значений
+        num_heads: int = 9,  # Количество голов внимания
         num_kv_heads: Optional[int] = None,
         qk_norm: str = 'l2',
         conv_size: int = 4,
         conv_bias: bool = False,
         gate_fn: str = 'swish',
         elementwise_affine: Optional[bool] = True,
-        norm_eps: float = 1e-5,
+        norm_eps: float = 1e-5,  # Для стабилизации нормализации
         gate_logit_normalizer: int = 16,
         fuse_norm: bool = True,
         layer_idx: int = None,
@@ -232,7 +176,7 @@ class GatedDeltaNet(nn.Module):
         use_mva: bool = False,
         use_residual: bool = False,
         use_input_gate: bool = False,
-        vocab_size: int = 50257,
+        vocab_size: int = 50257, # Добавлено - размер словаря
     ) -> GatedDeltaNet:
         super().__init__()
         self.qk_norm = qk_norm
@@ -267,15 +211,10 @@ class GatedDeltaNet(nn.Module):
         self.v_proj = nn.Linear(hidden_size, self.value_dim_per_group, bias=False)
         self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
 
-        # Эмбеддинг-слой
+        # Эмбеддинг-слой для входа и слой для выхода
         self.embedding = nn.Embedding(vocab_size, hidden_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size)
 
-        '''
-        self.q_conv1d = nn.Conv1d(self.key_dim, self.key_dim, conv_size, padding=conv_size-1, bias=conv_bias)
-        self.k_conv1d = nn.Conv1d(self.key_dim_per_group, self.key_dim_per_group, conv_size, padding=conv_size-1, bias=conv_bias)
-        self.v_conv1d = nn.Conv1d(self.value_dim_per_group, self.value_dim_per_group, conv_size, padding=conv_size-1, bias=conv_bias)
-        '''
         self.q_conv1d = ShortConvolution(self.key_dim, conv_size, activation='silu' if self.qk_norm != 'softmax' else None)
         self.k_conv1d = ShortConvolution(self.key_dim_per_group, conv_size, activation='silu' if self.qk_norm != 'softmax' else None)
         self.v_conv1d = ShortConvolution(self.value_dim_per_group, conv_size, activation='silu')
@@ -284,18 +223,11 @@ class GatedDeltaNet(nn.Module):
         self.b_proj = nn.Linear(hidden_size, self.num_heads, bias=True)
 
         if gate_fn == 'swish' and fuse_norm:
-            '''
-            self.g_norm_swish_gate = nn.Sequential(
-                nn.LayerNorm(self.head_v_dim, eps=norm_eps, elementwise_affine=elementwise_affine),
-                nn.SiLU()
-            )
-            '''
-            self.g_norm_swish_gate = CustomGate(head_v_dim=self.head_v_dim, norm_eps=norm_eps,
-                                                elementwise_affine=elementwise_affine)
+            self.g_norm_swish_gate = FusedRMSNormSwishGate(self.head_v_dim, elementwise_affine, norm_eps)
             self.fuse_norm_and_gate = True
         else:
             self.fuse_norm_and_gate = False
-            self.g_norm = nn.LayerNorm(self.head_v_dim, eps=norm_eps, elementwise_affine=elementwise_affine)
+            self.g_norm = RMSNorm(hidden_size=self.head_v_dim, elementwise_affine=elementwise_affine, eps=norm_eps)
             self.gate_fn = ACT2FN[gate_fn]
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
         self.gate_logit_normalizer = gate_logit_normalizer
@@ -346,17 +278,12 @@ class GatedDeltaNet(nn.Module):
 
         hidden_states = self.embedding(hidden_states)  # (batch_size, sequence_length, hidden_size)
 
-        # print(hidden_states.shape)
+        # Применяем линейные проекции для получения запросов, ключей и значений
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        # print(f'1. q {q.shape}, k {k.shape}, v {v.shape}')
-        '''
-        q = self.q_conv1d(q.transpose(1, 2)).transpose(1, 2)
-        k = self.k_conv1d(k.transpose(1, 2)).transpose(1, 2)
-        v = self.v_conv1d(v.transpose(1, 2)).transpose(1, 2)
-        '''
+        # Применяем свертки к запросам, ключам и значениям
         q = self.q_conv1d(q, attention_mask, conv_state_q)[0]
         k = self.k_conv1d(k, attention_mask, conv_state_k)[0]
         v = self.v_conv1d(v, attention_mask, conv_state_v)[0]
@@ -364,6 +291,7 @@ class GatedDeltaNet(nn.Module):
         if attention_mask is not None:
             v = v.mul_(attention_mask.unsqueeze(-1))
 
+        # Вычисляем гейты ("ворота")
         gk = self.gk_proj(hidden_states).float()
 
         if self.use_mamba_gate:
@@ -373,16 +301,21 @@ class GatedDeltaNet(nn.Module):
 
         gk = gk.transpose(1, 2)
 
-
+        # Вычисляем коэффициент beta
         beta = self.b_proj(hidden_states).float().sigmoid()
         beta = beta.transpose(1, 2)
 
+        # Реорганизуем запросы, ключи и значения для многоголового внимания
+        # (batch_size, sequence_length, hidden_size) -> (batch_size, num_heads, sequence_length, head_dim)
         q = rearrange(q, 'b l (h d) -> b h l d', h=self.num_heads)
         if self.num_kv_groups > 1:
+            # Если количество групп ключей и значений больше 1, повторяем их для каждой группы
             k, v = (repeat(x, 'b l (h d) -> b (h g) l d', h=self.num_kv_heads, g=self.num_kv_groups) for x in (k, v))
         else:
+            # Иначе просто реорганизуем
             k, v = (rearrange(x, 'b l (h d) -> b h l d', h=self.num_kv_heads) for x in (k, v))
 
+        # Применяем нормализацию к запросам и ключам
         assert self.qk_norm is not None
         if self.qk_norm == 'l2':
             q = F.normalize(q, p=2, dim=-1).to(v)
@@ -395,12 +328,14 @@ class GatedDeltaNet(nn.Module):
         else:
             raise KeyError
 
+        # Если используется входной гейт, применяем его к значениям
         if self.use_input_gate:
             original_v_dtype = v.dtype
             v = (v * (1 - gk.float().exp())[..., None]).to(original_v_dtype)
 
         recurrent_state = last_state[-1] if use_cache else None
 
+        # Применяем соответствующий механизм внимания
         if mode == 'chunk':
             o, recurrent_state = chunk_gated_delta_rule(q, k, v, beta, gk, initial_state=recurrent_state, output_final_state=use_cache)
         else:
@@ -413,18 +348,23 @@ class GatedDeltaNet(nn.Module):
                 last_state = (recurrent_state,)
             past_key_values.update(last_state, self.layer_idx, q.shape[2])
 
+        # Если используются остаточные связи, добавляем их к выходным значениям
         if self.use_residual:
             o = o + self.D[None, :, None, None] * v
         o = rearrange(o, 'b h l d -> b l h d')
 
+        # Применяем проекцию для гейтов
         g = self.g_proj(hidden_states)
         if self.fuse_norm_and_gate:
+            # Если нормализация и гейт объединены, применяем их вместе
             g = rearrange(g, 'b l (h d) -> b l h d', h=self.num_heads)
             o = self.g_norm_swish_gate(o, g)
             o = rearrange(o, 'b l h d -> b l (h d)')
         else:
             o = rearrange(self.g_norm(o), 'b l h d -> b l (h d)')
             o = o * self.gate_fn(g)
+
+        # Применяем финальную проекцию и преобразуем выходные значения в логиты
         o = self.o_proj(o)
         o = self.lm_head(o)
         return o, None, past_key_values
